@@ -54,6 +54,100 @@ content_types = {
     ".sh": "application/x-sh",
 }
 
+def print_help():
+    program_name = os.path.basename(sys.argv[0])
+    print(f"""{program_name} - upload files to S3-compatible storage
+
+Usage: {program_name} [OPTIONS] SOURCE_FILE BUCKET/PATH
+  or   {program_name} --help
+
+DESCRIPTION
+    Dependency-free tool for uploading files to S3-compatible storage services.
+    Implements AWS Signature Version 4 authentication.
+
+ARGUMENTS
+    SOURCE_FILE
+        Path to the local file to upload
+
+    BUCKET/PATH
+        Destination in the format bucket_name/object_key
+        Example: backup-bucket/archives/archive.tar
+
+OPTIONS
+    --help, -h
+        Display this help message and exit
+
+ENVIRONMENT VARIABLES
+    Authentication (Required):
+        S3_ACCESS_KEY_ID, AWS_ACCESS_KEY_ID
+            Access key ID for authentication.
+
+        S3_SECRET_ACCESS_KEY, AWS_SECRET_ACCESS_KEY
+            Secret access key for authentication.
+
+    Configuration (Optional):
+        S3_REGION, AWS_DEFAULT_REGION
+            AWS region for the S3 service (default: us-east-1)
+
+        S3_STORAGE_CLASS, AWS_S3_STORAGE_CLASS
+            Storage class for uploaded objects (e.g., STANDARD,STANDARD_IA,
+            GLACIER, DEEP_ARCHIVE)
+
+        S3_BASE_DOMAIN, AWS_S3_BASE_DOMAIN
+            Custom S3-compatible base service domain (e.g., s3.example.com)
+
+    Provider-Specific:
+        S3_CLOUDFLARE_ACCOUNT_ID
+            Cloudflare R2 account ID. When set, uses R2 endpoints:
+            BUCKET.ACCOUNT_ID.r2.cloudflarestorage.com
+
+        S3_ORACLE_CLOUD_NAMESPACE
+            Oracle Cloud namespace. When set, uses Oracle Cloud endpoints:
+            BUCKET.NAMESPACE.compat.objectstorage.REGION.oraclecloud.com
+
+EXAMPLES
+    Basic AWS S3 upload:
+        export AWS_ACCESS_KEY_ID="AKIAIOSFODNN7EXAMPLE"
+        export AWS_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        {program_name} archive.tar backup-bucket/archives/archive.tar
+
+    Upload with storage class:
+        export S3_STORAGE_CLASS="GLACIER"
+        {program_name} archive.tar backup-bucket/archives/archive.tar
+
+    Cloudflare R2 upload:
+        export S3_ACCESS_KEY_ID="AKIAIOSFODNN7EXAMPLE"
+        export S3_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        export S3_CLOUDFLARE_ACCOUNT_ID="a8f2b4e6d9c1f7a3b5e8d2c9f4a7b1e6"
+        {program_name} archive.tar r2-backup-bucket/archives/archive.tar
+
+    Oracle Cloud Object Storage:
+        export S3_ACCESS_KEY_ID="AKIAIOSFODNN7EXAMPLE"
+        export S3_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        export S3_ORACLE_CLOUD_NAMESPACE="tenancy9423"
+        export S3_REGION="us-ashburn-1"
+        {program_name} archive.tar oci-backup-bucket/archives/archive.tar
+
+    Custom S3-compatible service:
+        export S3_ACCESS_KEY_ID="AKIAIOSFODNN7EXAMPLE"
+        export S3_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        export S3_DOMAIN="s3.example.com"
+        {program_name} archive.tar s3-backup-bucket/archives/archive.tar
+
+SUPPORTED FILE TYPES
+    The tool automatically detects MIME types for file extensions:
+    - Web files: .html, .css, .js, .json, .xml
+    - Images: .jpg, .png, .gif, .svg, .webp, .ico
+    - Documents: .pdf, .txt, .md, .csv
+    - Archives: .zip, .gz, .tar, .rar, .7z
+    - Executables: .exe, .dll, .so, .apk, .deb, .rpm
+    - Fonts: .ttf, .otf, .woff, .woff2
+    - Code: .py, .go, .sh
+
+EXIT STATUS
+    0   Success
+    1   Error (missing arguments, authentication failure, upload failure)""")
+
 class ProgressFileReader:
     def __init__(self, file_path, chunk_size=8192):
         self.file = open(file_path, "rb")
@@ -104,29 +198,50 @@ def sha256_hexdigest_file(file_path):
     return h.hexdigest()
 
 def main():
+    program_name = os.path.basename(sys.argv[0])
+
+    if len(sys.argv) == 2 and sys.argv[1] in ("--help", "-h"):
+        print_help()
+        sys.exit(0)
+
     if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <source_file> <bucket/path>",
+        print(f"Usage: {program_name} <source_file> <bucket/path>",
+            file=sys.stderr)
+        print(f"Try '{program_name} --help' for more information",
             file=sys.stderr)
         sys.exit(1)
 
     source_file_path = sys.argv[1]
     dest_path = sys.argv[2]
 
-    access_key = os.environ.get("AWS_ACCESS_KEY_ID")
-    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
-    region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-    storage_class = os.environ.get("AWS_S3_STORAGE_CLASS")
-    base_domain = os.environ.get("AWS_S3_DOMAIN")
-    cloudflare_account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
-    oracle_cloud_namespace = os.environ.get("ORACLE_CLOUD_NAMESPACE")
+    if not os.path.isfile(source_file_path):
+        print(f"Error: Source file '{source_file_path}' not found",
+            file=sys.stderr)
+        sys.exit(1)
+
+    access_key = os.environ.get("S3_ACCESS_KEY_ID",
+        os.environ.get("AWS_ACCESS_KEY_ID"))
+    secret_key = os.environ.get("S3_SECRET_ACCESS_KEY",
+        os.environ.get("AWS_SECRET_ACCESS_KEY"))
+    region = os.environ.get("S3_REGION",
+        os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+    storage_class = os.environ.get("S3_STORAGE_CLASS",
+        os.environ.get("AWS_S3_STORAGE_CLASS"))
+    base_domain = os.environ.get("S3_DOMAIN",
+        os.environ.get("AWS_S3_DOMAIN"))
+    cloudflare_account_id = os.environ.get("S3_CLOUDFLARE_ACCOUNT_ID")
+    oracle_cloud_namespace = os.environ.get("S3_ORACLE_CLOUD_NAMESPACE")
 
     if not access_key or not secret_key:
-        print("Missing required environment variables", file=sys.stderr)
+        print("Error: Missing required environment variables",
+            file=sys.stderr)
+        print(f"Try '{program_name} --help' for more information",
+            file=sys.stderr)
         sys.exit(1)
 
     if "/" not in dest_path:
-        print("Destination path must include bucket and " +
-            "object key (e.g. bucket/file.txt)", file=sys.stderr)
+        print("Error: Destination path must include bucket and " +
+            "object key (e.g. bucket/archive.tar)", file=sys.stderr)
         sys.exit(1)
 
     bucket, s3_key = dest_path.split("/", 1)
@@ -136,6 +251,8 @@ def main():
     elif cloudflare_account_id:
         host = f"{cloudflare_account_id}.r2.cloudflarestorage.com"
     elif oracle_cloud_namespace:
+        if region == "us-east-1":
+            region = "us-ashburn-1"
         host = (f"{oracle_cloud_namespace}.compat.objectstorage"
             f".{region}.oraclecloud.com")
     else:
@@ -166,6 +283,7 @@ def main():
     if storage_class:
         canonical_headers += f"x-amz-storage-class:{storage_class}\n"
         signed_headers += ";x-amz-storage-class"
+
     canonical_request = (
         f"{method}\n"
         f"{uri}\n"
@@ -203,6 +321,8 @@ def main():
 
     if storage_class:
         headers["x-amz-storage-class"] = storage_class
+
+    print(f"Uploading to: {host}")
 
     conn = http.client.HTTPSConnection(host)
     reader = ProgressFileReader(source_file_path)
