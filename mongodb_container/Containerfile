@@ -1,0 +1,56 @@
+FROM oraclelinux:9-slim
+
+RUN microdnf -y update
+RUN groupadd --gid 277 --system mongodb
+RUN useradd --uid 277 --system --gid mongodb --home-dir /data/db mongodb
+RUN mkdir -p /data/db
+RUN chown -R mongodb:mongodb /data/db
+
+RUN echo $'[mongodb-org]\n\
+name=MongoDB Repository\n\
+baseurl=https://repo.mongodb.org/yum/redhat/9/mongodb-org/8.0/x86_64/\n\
+gpgcheck=1\n\
+enabled=1\n\
+gpgkey=https://www.mongodb.org/static/pgp/server-8.0.asc\n' > /etc/yum.repos.d/mongo.repo
+
+RUN microdnf -y install mongodb-org
+RUN microdnf clean all
+ENV DB_NAME=pritunl
+ENV CACHE_SIZE=1
+
+RUN echo $'#!/bin/bash\n\
+set -e\n\
+\n\
+if [ ! -f "/data/db/credentials.txt" ]; then\n\
+  echo "Initializing MongoDB database..."\n\
+  export ADMIN_PASSWORD=$(cat /dev/urandom | tr -dc "a-zA-Z0-9" | fold -w 32 | head -n 1)\n\
+  export DB_PASSWORD=$(cat /dev/urandom | tr -dc "a-zA-Z0-9" | fold -w 32 | head -n 1)\n\
+\n\
+  mongod --bind_ip 127.0.0.1 --port 27017 --logpath "/proc/$$/fd/1" --fork\n\
+\n\
+  mongosh --host 127.0.0.1 --port 27017 --quiet admin << EOF\n\
+  db.createUser({\n\
+    user: "admin",\n\
+    pwd: "${ADMIN_PASSWORD}",\n\
+    roles: ["root"]\n\
+  })\n\
+  db.createUser({\n\
+    user: "${DB_NAME}",\n\
+    pwd: "${DB_PASSWORD}",\n\
+    roles: [{role: "dbOwner", db: "${DB_NAME}"}]\n\
+  })\n\
+EOF\n\
+  mongod --shutdown\n\
+  touch /data/db/credentials.txt\n\
+  chmod 600 /data/db/credentials.txt\n\
+  echo "admin:${ADMIN_PASSWORD}" >> /data/db/credentials.txt\n\
+  echo "${DB_NAME}:${DB_PASSWORD}" >> /data/db/credentials.txt\n\
+  echo "mongodb://${DB_NAME}:${DB_PASSWORD}@127.0.0.1:27017/${DB_NAME}?authSource=admin" >> /data/db/credentials.txt\n\
+  echo "# MongoDB initialization completed."\n\
+fi\n\
+exec "$@"\n' > /mongodb.sh
+RUN chmod +x /mongodb.sh
+
+EXPOSE 27017
+ENTRYPOINT ["/mongodb.sh"]
+CMD mongod --bind_ip 0.0.0.0 --port 27017 --auth --wiredTigerCacheSizeGB ${CACHE_SIZE}
