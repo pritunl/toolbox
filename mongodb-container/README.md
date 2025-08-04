@@ -19,8 +19,18 @@ sudo podman run -d --name mongodb -e DB_NAME=pritunl-cloud -e CACHE_SIZE=2 --cpu
 # public bind
 sudo podman run -d --name mongodb -e DB_NAME=pritunl-cloud -e CACHE_SIZE=2 --cpus 2 --memory 4g --user mongodb -v /var/lib/mongo:/data/db:Z -p 27017:27017 localhost/mongo
 
+# mongodb shell in container
+sudo podman exec -it mongodb bash
+mongosh -u admin --authenticationDatabase admin
+​
+# update
+sudo podman exec -u root mongodb update
+sudo podman restart mongodb
+
+# credentials
 sudo cat /var/lib/mongo/credentials.txt
 
+# external mongodb shell
 sudo tee /etc/yum.repos.d/mongodb-org.repo << EOF
 [mongodb-org]
 name=MongoDB Repository
@@ -29,8 +39,6 @@ gpgcheck=1
 enabled=1
 gpgkey=https://www.mongodb.org/static/pgp/server-8.0.asc
 EOF
-
 sudo dnf -y install mongodb-mongosh
-
 mongosh --host 127.0.0.1 --port 27017 -u admin --authenticationDatabase admin admin
 ```

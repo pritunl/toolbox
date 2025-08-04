@@ -20,6 +20,20 @@ ENV CACHE_SIZE=1
 
 RUN echo $'#!/bin/bash\n\
 set -e\n\
+echo "Initializing container update..."\n\
+if [ "$EUID" -ne 0 ]; then\n\
+    echo "Update must be run as root:"\n\
+    echo "podman exec --user root <container-name> update"\n\
+    exit 1\n\
+fi\n\
+microdnf -y update\n\
+echo "Update complete, container restart required:"\n\
+echo "podman restart <container-name>"\n\
+' > /usr/bin/update
+RUN chmod +x /usr/bin/update
+
+RUN echo $'#!/bin/bash\n\
+set -e\n\
 \n\
 if [ ! -f "/data/db/credentials.txt" ]; then\n\
   echo "Initializing MongoDB database..."\n\
