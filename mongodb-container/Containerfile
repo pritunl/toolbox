@@ -27,6 +27,7 @@ if [ "$EUID" -ne 0 ]; then\n\
     exit 1\n\
 fi\n\
 microdnf -y update\n\
+chown -R mongodb:mongodb /data/db
 echo "Update complete, container restart required:"\n\
 echo "podman restart <container-name>"\n\
 ' > /usr/bin/update
