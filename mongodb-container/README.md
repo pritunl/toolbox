@@ -14,10 +14,52 @@ sudo mkdir /var/lib/mongo
 sudo chown 277:277 /var/lib/mongo
 
 # localhost bind
-sudo podman run -d --name mongodb -e DB_NAME=pritunl-cloud -e CACHE_SIZE=2 --cpus 2 --memory 4g --user mongodb -v /var/lib/mongo:/data/db:Z -p 127.0.0.1:27017:27017 localhost/mongo
+sudo tee /etc/containers/systemd/mongodb-podman.container << EOF
+[Unit]
+Description=MongoDB Podman Service
+
+[Container]
+Image=localhost/mongo
+ContainerName=mongodb
+Environment=DB_NAME=pritunl-cloud
+Environment=CACHE_SIZE=2
+User=mongodb
+Volume=/var/lib/mongo:/data/db:Z
+PublishPort=127.0.0.1:27017:27017
+PodmanArgs=--cpus=2 --memory=4g
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 # public bind
-sudo podman run -d --name mongodb -e DB_NAME=pritunl-cloud -e CACHE_SIZE=2 --cpus 2 --memory 4g --user mongodb -v /var/lib/mongo:/data/db:Z -p 27017:27017 localhost/mongo
+sudo tee /etc/containers/systemd/mongodb-podman.container << EOF
+[Unit]
+Description=MongoDB Podman Service
+
+[Container]
+Image=localhost/mongo
+ContainerName=mongodb
+Environment=DB_NAME=pritunl-cloud
+Environment=CACHE_SIZE=2
+User=mongodb
+Volume=/var/lib/mongo:/data/db:Z
+PublishPort=27017:27017
+PodmanArgs=--cpus=2 --memory=4g
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# start mongodb container
+sudo systemctl daemon-reload
+sudo systemctl start mongodb-podman.service
 
 # mongodb shell in container
 sudo podman exec -it mongodb bash
