@@ -1,6 +1,6 @@
 ## Live Sync
 
-Live sync changes in a directory using rsync and inotifywait.
+Live sync changes in a directory to remotes using rsync and inotifywait.
 
 ```shell
 sudo dnf install rsync inotify-tools
@@ -18,7 +18,6 @@ lsync.sync(
     ],
     excludes=[
         ".*",
-        "*.key",
         "*.pyc",
         "node_modules",
         "jspm_packages",
