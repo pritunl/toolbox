@@ -119,7 +119,6 @@ def _compile_pattern(pattern: str):
 
 def _compile_patterns(patterns: typing.List[str]):
     matchers = []
-
     for pattern in patterns:
         matchers.append(_compile_pattern(pattern))
 
