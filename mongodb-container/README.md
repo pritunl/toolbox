@@ -8,7 +8,7 @@ sudo podman stop mongodb
 sudo podman rm mongodb
 sudo rm -rf /var/lib/mongo
 
-sudo podman build --rm -t mongo .
+sudo podman build --no-cache --rm -t mongo .
 
 sudo mkdir /var/lib/mongo
 sudo chown 277:277 /var/lib/mongo
@@ -66,8 +66,8 @@ sudo podman exec -it mongodb bash
 mongosh -u admin --authenticationDatabase admin
 ​
 # update
-sudo podman exec -u root mongodb update
-sudo podman restart mongodb
+sudo podman build --no-cache --rm -t mongo .
+sudo systemctl restart mongodb-podman.service
 
 # credentials
 sudo cat /var/lib/mongo/credentials.txt
