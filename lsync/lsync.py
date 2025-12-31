@@ -151,7 +151,21 @@ def _sync(
         if ":" not in dest:
             print("Error: destination must be remote path")
             sys.exit(1)
-        parts = dest.strip().split(":", 1)
+
+        dest_stripped = dest.strip()
+        if "[" in dest_stripped:
+            bracket_start = dest_stripped.find("[")
+            bracket_end = dest_stripped.find("]", bracket_start)
+            if bracket_end == -1 or bracket_end + 1 >= len(dest_stripped) or \
+                    dest_stripped[bracket_end + 1] != ":":
+                print("Error: destination path invalid")
+                sys.exit(1)
+            host = dest_stripped[:bracket_end + 1]
+            path = dest_stripped[bracket_end + 2:]
+            parts = [host, path]
+        else:
+            parts = dest_stripped.split(":", 1)
+
         if len(parts) != 2:
             print("Error: destination path invalid")
             sys.exit(1)
