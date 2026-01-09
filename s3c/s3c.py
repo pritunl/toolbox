@@ -65,6 +65,7 @@ def print_help():
 Usage: {program_name} [OPTIONS] cp SOURCE DESTINATION
   or   {program_name} [OPTIONS] ls PROVIDER:[PATH]
   or   {program_name} [OPTIONS] rm PROVIDER:/PATH
+  or   {program_name} [OPTIONS] mirror [--remove] LOCAL_DIR PROVIDER:/PATH
   or   {program_name} [OPTIONS] add-provider
   or   {program_name} --help
 
@@ -75,7 +76,7 @@ DESCRIPTION
 
 COMMANDS
     cp SOURCE DESTINATION
-        Copy files between local filesystem and S3-compatible storage
+        Copy files between local filesystem and S3-compatible storage.
 
         Upload:   {program_name} cp ./file.tar provider:/path/file.tar
         Download: {program_name} cp provider:/path/file.tar ./file.tar
@@ -87,12 +88,23 @@ COMMANDS
         List folder:     {program_name} ls provider:/folder/
 
     rm PROVIDER:/PATH
-        Remove object from S3-compatible storage
+        Remove object from S3-compatible storage.
 
         Remove file:     {program_name} rm provider:/path/file.tar
 
+    mirror [--remove] LOCAL_DIR PROVIDER:/PATH
+        Mirror a local directory to S3, syncing based on modification times.
+        Files are uploaded if they don't exist on S3 or local modification
+        time is newer than S3 modification time. Files are skipped if S3
+        modification time is equal to or newer than local modification time.
+
+        --remove: Delete files on S3 that don't exist locally
+
+        Example:     {program_name} mirror ./dist provider:/website/
+        With remove: {program_name} mirror --remove ./dist provider:/website/
+
     add-provider
-        Interactively add a new provider configuration
+        Interactively add a new provider configuration.
 
 OPTIONS
     --config, -c PATH
@@ -659,6 +671,91 @@ def list_objects(config, prefix=""):
     finally:
         conn.close()
 
+def list_objects_recursive(config, prefix=""):
+    host, uri = get_host_and_uri(config)
+    all_objects = []
+    continuation_token = None
+
+    while True:
+        query_params = {}
+        if prefix:
+            query_params["prefix"] = prefix
+        if continuation_token:
+            query_params["continuation-token"] = continuation_token
+
+        headers = create_auth_headers("GET", host, uri, config,
+            query_params=query_params)
+
+        conn = http.client.HTTPSConnection(host)
+
+        try:
+            query_string = ""
+            if query_params:
+                query_string = "?" + "&".join(
+                    f"{k}={urllib.parse.quote(str(v))}"
+                    for k, v in query_params.items()
+                )
+
+            conn.request("GET", uri + query_string, headers=headers)
+            response = conn.getresponse()
+
+            if response.status != 200:
+                body = response.read().decode()
+                print(f"Error: {response.status} {response.reason}",
+                    file=sys.stderr)
+                print(body, file=sys.stderr)
+                return None
+
+            body = response.read().decode()
+
+            try:
+                root = xml.etree.ElementTree.fromstring(body)
+
+                ns = ""
+                if root.tag.startswith("{"):
+                    ns = "{" + root.tag.split("}")[0][1:] + "}"
+
+                for content in root.findall(f"{ns}Contents"):
+                    key_elem = content.find(f"{ns}Key")
+                    size_elem = content.find(f"{ns}Size")
+                    modified_elem = content.find(f"{ns}LastModified")
+
+                    if key_elem is not None:
+                        key = key_elem.text
+                        size = int(size_elem.text) if \
+                            size_elem is not None else 0
+                        modified = modified_elem.text if \
+                            modified_elem is not None else ""
+
+                        all_objects.append({
+                            "key": key,
+                            "size": size,
+                            "modified": modified
+                        })
+
+                is_truncated = root.find(f"{ns}IsTruncated")
+                if is_truncated is not None and is_truncated.text == "true":
+                    next_token = root.find(f"{ns}NextContinuationToken")
+                    if next_token is not None:
+                        continuation_token = next_token.text
+                    else:
+                        break
+                else:
+                    break
+
+            except xml.etree.ElementTree.ParseError as e:
+                print(f"Error parsing XML response: {e}", file=sys.stderr)
+                print(body, file=sys.stderr)
+                return None
+
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return None
+        finally:
+            conn.close()
+
+    return all_objects
+
 def remove_object(config, s3_key):
     host, uri = get_host_and_uri(config, s3_key)
     headers = create_auth_headers("DELETE", host, uri, config)
@@ -686,6 +783,141 @@ def remove_object(config, s3_key):
         return False
     finally:
         conn.close()
+
+def mirror_directory(config, local_path, s3_prefix, remove_extra=False):
+    if not os.path.isdir(local_path):
+        print(f"Error: Local path '{local_path}' is not a directory",
+            file=sys.stderr)
+        return False
+
+    print(f"Scanning local directory: {local_path}")
+
+    local_files = {}
+    for root, _, files in os.walk(local_path):
+        for filename in files:
+            local_file_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(local_file_path, local_path)
+            rel_path = rel_path.replace(os.sep, "/")
+
+            mtime = os.path.getmtime(local_file_path)
+            size = os.path.getsize(local_file_path)
+
+            local_files[rel_path] = {
+                "path": local_file_path,
+                "mtime": mtime,
+                "size": size
+            }
+
+    print(f"Found {len(local_files)} local files")
+    print(f"Listing remote objects with prefix: {s3_prefix}")
+
+    remote_objects = list_objects_recursive(config, s3_prefix)
+    if remote_objects is None:
+        print("Error: Failed to list remote objects", file=sys.stderr)
+        return False
+
+    remote_files = {}
+    for obj in remote_objects:
+        key = obj["key"]
+        if s3_prefix and key.startswith(s3_prefix):
+            rel_key = key[len(s3_prefix):]
+            if rel_key.startswith("/"):
+                rel_key = rel_key[1:]
+        else:
+            rel_key = key
+
+        if rel_key:
+            try:
+                s3_mtime_str = obj["modified"]
+                s3_dt = datetime.datetime.fromisoformat(
+                    s3_mtime_str.replace("Z", "+00:00"))
+                s3_mtime = s3_dt.timestamp()
+
+                remote_files[rel_key] = {
+                    "key": key,
+                    "mtime": s3_mtime,
+                    "size": obj["size"]
+                }
+            except:
+                remote_files[rel_key] = {
+                    "key": key,
+                    "mtime": 0,
+                    "size": obj["size"]
+                }
+
+    print(f"Found {len(remote_files)} remote files")
+
+    files_to_upload = []
+    files_to_skip = []
+
+    for rel_path, local_info in local_files.items():
+        if rel_path in remote_files:
+            remote_info = remote_files[rel_path]
+
+            time_diff = local_info["mtime"] - remote_info["mtime"]
+            if time_diff > -10:
+                files_to_upload.append(rel_path)
+            else:
+                files_to_skip.append(rel_path)
+        else:
+            files_to_upload.append(rel_path)
+
+    files_to_remove = []
+    if remove_extra:
+        for rel_key in remote_files:
+            if rel_key not in local_files:
+                files_to_remove.append(rel_key)
+
+    print(f"\nSync summary:")
+    print(f"  Files to upload: {len(files_to_upload)}")
+    print(f"  Files to skip (up-to-date): {len(files_to_skip)}")
+    if remove_extra:
+        print(f"  Files to remove: {len(files_to_remove)}")
+    print()
+
+    upload_success = 0
+    upload_failed = 0
+
+    for i, rel_path in enumerate(files_to_upload, 1):
+        local_file_path = local_files[rel_path]["path"]
+        s3_key = s3_prefix
+        if s3_key and not s3_key.endswith("/"):
+            s3_key += "/"
+        s3_key += rel_path
+
+        print(f"[{i}/{len(files_to_upload)}] Uploading: {rel_path}")
+
+        if upload_file(config, local_file_path, s3_key):
+            upload_success += 1
+        else:
+            upload_failed += 1
+            print(f"Failed to upload: {rel_path}", file=sys.stderr)
+
+    remove_success = 0
+    remove_failed = 0
+
+    if remove_extra and files_to_remove:
+        print()
+        for i, rel_key in enumerate(files_to_remove, 1):
+            s3_key = remote_files[rel_key]["key"]
+            print(f"[{i}/{len(files_to_remove)}] Removing: {rel_key}")
+
+            if remove_object(config, s3_key):
+                remove_success += 1
+            else:
+                remove_failed += 1
+                print(f"Failed to remove: {rel_key}", file=sys.stderr)
+
+    print(f"\nMirror complete:")
+    print(f"  Uploaded: {upload_success}/{len(files_to_upload)}")
+    if upload_failed > 0:
+        print(f"  Upload failed: {upload_failed}")
+    if remove_extra:
+        print(f"  Removed: {remove_success}/{len(files_to_remove)}")
+        if remove_failed > 0:
+            print(f"  Remove failed: {remove_failed}")
+
+    return upload_failed == 0 and remove_failed == 0
 
 def parse_s3_path(path):
     if ":" not in path:
@@ -724,6 +956,8 @@ def main():
             file=sys.stderr)
         print(f"   or: {program_name} [OPTIONS] rm PROVIDER:/PATH",
             file=sys.stderr)
+        print(f"   or: {program_name} [OPTIONS] mirror [--remove] " +
+            "LOCAL_DIR PROVIDER:/PATH", file=sys.stderr)
         print(f"   or: {program_name} [OPTIONS] add-provider",
             file=sys.stderr)
         print(f"Try '{program_name} --help' for more information",
@@ -839,6 +1073,45 @@ def main():
                 sys.exit(1)
 
         success = remove_object(provider_config, s3_key)
+        sys.exit(0 if success else 1)
+
+    elif command == "mirror":
+        remove_extra = False
+        mirror_args = args[1:]
+
+        if mirror_args and mirror_args[0] == "--remove":
+            remove_extra = True
+            mirror_args = mirror_args[1:]
+
+        if len(mirror_args) != 2:
+            print(f"Usage: {program_name} mirror [--remove] LOCAL_DIR " +
+                "PROVIDER:/PATH", file=sys.stderr)
+            sys.exit(1)
+
+        local_path = mirror_args[0]
+        remote_path = mirror_args[1]
+
+        provider, s3_prefix = parse_s3_path(remote_path)
+
+        if not provider:
+            print("Error: Remote path must be in provider:/path format",
+                file=sys.stderr)
+            sys.exit(1)
+
+        config = load_config(config_path)
+        provider_config = get_provider_config(provider, config)
+
+        if not provider_config:
+            provider_config = get_credentials_from_env(provider)
+            if (not provider_config["access_key"] or
+                    not provider_config["secret_access_key"]):
+                print(f"Error: No configuration found for provider " +
+                    f"'{provider}' and no environment variables set",
+                    file=sys.stderr)
+                sys.exit(1)
+
+        success = mirror_directory(provider_config, local_path, s3_prefix,
+            remove_extra)
         sys.exit(0 if success else 1)
 
     else:
