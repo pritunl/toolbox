@@ -10,6 +10,8 @@ import getpass
 import http.client
 import urllib.parse
 import xml.etree.ElementTree
+import threading
+import queue
 
 content_types = {
     ".html": "text/html",
@@ -65,7 +67,7 @@ def print_help():
 Usage: {program_name} [OPTIONS] cp SOURCE DESTINATION
   or   {program_name} [OPTIONS] ls [--recursive] PROVIDER:[PATH]
   or   {program_name} [OPTIONS] rm PROVIDER:/PATH
-  or   {program_name} [OPTIONS] mirror [--remove] LOCAL_DIR PROVIDER:/PATH
+  or   {program_name} [OPTIONS] mirror [--remove] [--overwrite] [--jobs N] LOCAL_DIR PROVIDER:/PATH
   or   {program_name} [OPTIONS] add-provider
   or   {program_name} --help
 
@@ -95,7 +97,7 @@ COMMANDS
 
         Remove file: {program_name} rm provider:/path/file.tar
 
-    mirror [--remove] [--overwrite] LOCAL_DIR PROVIDER:/PATH
+    mirror [--remove] [--overwrite] [--jobs N] LOCAL_DIR PROVIDER:/PATH
         Mirror a local directory to S3, syncing based on modification times.
         Files are uploaded if they don't exist on S3 or local modification
         time is newer than S3 modification time. Files are skipped if S3
@@ -103,10 +105,12 @@ COMMANDS
 
         --remove: Delete files on S3 that don't exist locally
         --overwrite: Upload all files regardless of modification time
+        --jobs N: Upload N files in parallel (default: 1)
 
         Example: {program_name} mirror ./dist/ provider:/website/
                  {program_name} mirror --remove ./dist/ provider:/website/
                  {program_name} mirror --overwrite ./dist/ provider:/website/
+                 {program_name} mirror --jobs 4 ./dist/ provider:/website/
 
     add-provider
         Interactively add a new provider configuration.
@@ -492,7 +496,7 @@ def create_auth_headers(method, host, uri, config, content_type=None,
 
     return headers_dict
 
-def upload_file(config, source_file_path, s3_key):
+def upload_file(config, source_file_path, s3_key, show_progress=True):
     if not os.path.isfile(source_file_path):
         print(f"Error: Source file '{source_file_path}' not found",
             file=sys.stderr)
@@ -508,28 +512,39 @@ def upload_file(config, source_file_path, s3_key):
     headers = create_auth_headers("PUT", host, uri, config, content_type,
         content_length, payload_hash)
 
-    print(f"Uploading to: {host}")
+    if show_progress:
+        print(f"Uploading to: {host}")
 
     conn = http.client.HTTPSConnection(host)
-    reader = ProgressFileReader(source_file_path)
+
+    if show_progress:
+        reader = ProgressFileReader(source_file_path)
+    else:
+        reader = open(source_file_path, "rb")
 
     try:
         conn.request("PUT", uri, body=reader, headers=headers)
         response = conn.getresponse()
-        print(f"\nStatus: {response.status} {response.reason}")
+
+        if show_progress:
+            print(f"\nStatus: {response.status} {response.reason}")
 
         if response.status >= 300:
             body = response.read().decode()
-            print(body, file=sys.stderr)
+            if show_progress:
+                print(body, file=sys.stderr)
             return False
         else:
-            print(f"Upload successful: {config['bucket']}/{s3_key}")
+            if show_progress:
+                print(f"Upload successful: {config['bucket']}/{s3_key}")
             return True
     except Exception as e:
-        print(f"\nError: {e}", file=sys.stderr)
+        if show_progress:
+            print(f"\nError: {e}", file=sys.stderr)
         return False
     finally:
-        reader.close()
+        if hasattr(reader, 'close'):
+            reader.close()
         conn.close()
 
 def download_file(config, s3_key, dest_file_path):
@@ -781,8 +796,8 @@ def get_objects_recursive(config, prefix=""):
                     if next_token is not None:
                         continuation_token = next_token.text
                     else:
-                        print(f"Response is truncated but " +
-                            "no continuation token found!")
+                        print("Response is truncated but " +
+                            "no continuation token found")
                         break
                 else:
                     break
@@ -829,7 +844,7 @@ def remove_object(config, s3_key):
         conn.close()
 
 def mirror_directory(config, local_path, s3_prefix,
-        remove_extra=False, overwrite=False):
+        remove_extra=False, overwrite=False, jobs=1):
     if not os.path.isdir(local_path):
         print(f"Error: Local path '{local_path}' is not a directory",
             file=sys.stderr)
@@ -926,20 +941,108 @@ def mirror_directory(config, local_path, s3_prefix,
     upload_success = 0
     upload_failed = 0
 
-    for i, rel_path in enumerate(files_to_upload, 1):
-        local_file_path = local_files[rel_path]["path"]
-        s3_key = s3_prefix
-        if s3_key and not s3_key.endswith("/"):
-            s3_key += "/"
-        s3_key += rel_path
+    if jobs == 1:
+        for i, rel_path in enumerate(files_to_upload, 1):
+            local_file_path = local_files[rel_path]["path"]
+            s3_key = s3_prefix
+            if s3_key and not s3_key.endswith("/"):
+                s3_key += "/"
+            s3_key += rel_path
 
-        print(f"[{i}/{len(files_to_upload)}] Uploading: {rel_path}")
+            print(f"[{i}/{len(files_to_upload)}] Uploading: {rel_path}")
 
-        if upload_file(config, local_file_path, s3_key):
-            upload_success += 1
-        else:
-            upload_failed += 1
-            print(f"Failed to upload: {rel_path}", file=sys.stderr)
+            if upload_file(config, local_file_path, s3_key):
+                upload_success += 1
+            else:
+                upload_failed += 1
+                print(f"Failed to upload: {rel_path}", file=sys.stderr)
+    else:
+        upload_lock = threading.Lock()
+        upload_queue = queue.Queue()
+
+        total_bytes = sum(local_files[rel_path]["size"]
+            for rel_path in files_to_upload)
+
+        progress_state = {
+            "completed_count": 0,
+            "uploaded_bytes": 0,
+            "start_time": time.time(),
+            "last_update": 0
+        }
+
+        def print_progress():
+            now = time.time()
+            if now - progress_state["last_update"] < 0.1:
+                return
+            progress_state["last_update"] = now
+
+            elapsed = now - progress_state["start_time"]
+            percent = (progress_state["uploaded_bytes"] / total_bytes * 100) \
+                if total_bytes > 0 else 0
+            uploaded_mb = progress_state["uploaded_bytes"] / (1024 * 1024)
+            total_mb = total_bytes / (1024 * 1024)
+
+            if elapsed > 0:
+                speed_bps = progress_state["uploaded_bytes"] / elapsed
+                speed_mbps = speed_bps / (1024 * 1024)
+                speed_str = f" @ {speed_mbps:.1f} MB/s"
+            else:
+                speed_str = ""
+
+            print(f"\rProgress: {percent:.1f}% ({uploaded_mb:.2f}/" +
+                  f"{total_mb:.2f} MB){speed_str} " +
+                  f"[{progress_state['completed_count']}/" +
+                  f"{len(files_to_upload)} files]",
+                  end="", flush=True)
+
+        def upload_worker():
+            nonlocal upload_success, upload_failed
+            while True:
+                item = upload_queue.get()
+                if item is None:
+                    break
+
+                _, rel_path = item
+                local_file_path = local_files[rel_path]["path"]
+                file_size = local_files[rel_path]["size"]
+                s3_key = s3_prefix
+                if s3_key and not s3_key.endswith("/"):
+                    s3_key += "/"
+                s3_key += rel_path
+
+                success = upload_file(config, local_file_path, s3_key,
+                    show_progress=False)
+
+                with upload_lock:
+                    progress_state["completed_count"] += 1
+                    progress_state["uploaded_bytes"] += file_size
+                    if success:
+                        upload_success += 1
+                    else:
+                        upload_failed += 1
+                    print_progress()
+
+                upload_queue.task_done()
+
+        threads = []
+        for _ in range(jobs):
+            t = threading.Thread(target=upload_worker, daemon=True)
+            t.start()
+            threads.append(t)
+
+        for i, rel_path in enumerate(files_to_upload, 1):
+            upload_queue.put((i, rel_path))
+
+        upload_queue.join()
+
+        with upload_lock:
+            print_progress()
+            print()
+
+        for _ in range(jobs):
+            upload_queue.put(None)
+        for t in threads:
+            t.join()
 
     remove_success = 0
     remove_failed = 0
@@ -1005,7 +1108,8 @@ def main():
         print(f"   or: {program_name} [OPTIONS] rm PROVIDER:/PATH",
             file=sys.stderr)
         print(f"   or: {program_name} [OPTIONS] mirror [--remove] " +
-            "[--overwrite] LOCAL_DIR PROVIDER:/PATH", file=sys.stderr)
+            "[--overwrite] [--jobs N] LOCAL_DIR PROVIDER:/PATH",
+            file=sys.stderr)
         print(f"   or: {program_name} [OPTIONS] add-provider",
             file=sys.stderr)
         print(f"Try '{program_name} --help' for more information",
@@ -1133,6 +1237,7 @@ def main():
     elif command == "mirror":
         remove_extra = False
         overwrite_all = False
+        jobs = 1
         mirror_args = args[1:]
 
         while mirror_args and mirror_args[0].startswith("--"):
@@ -1142,6 +1247,22 @@ def main():
             elif mirror_args[0] == "--overwrite":
                 overwrite_all = True
                 mirror_args = mirror_args[1:]
+            elif mirror_args[0] == "--jobs":
+                if len(mirror_args) < 2:
+                    print("Error: --jobs requires a number argument",
+                        file=sys.stderr)
+                    sys.exit(1)
+                try:
+                    jobs = int(mirror_args[1])
+                    if jobs < 1:
+                        print("Error: --jobs must be at least 1",
+                            file=sys.stderr)
+                        sys.exit(1)
+                except ValueError:
+                    print(f"Error: --jobs requires a number, "
+                        f"got '{mirror_args[1]}'", file=sys.stderr)
+                    sys.exit(1)
+                mirror_args = mirror_args[2:]
             else:
                 print(f"Error: Unknown option '{mirror_args[0]}'",
                     file=sys.stderr)
@@ -1149,7 +1270,7 @@ def main():
 
         if len(mirror_args) != 2:
             print(f"Usage: {program_name} mirror [--remove] [--overwrite] " +
-                "LOCAL_DIR PROVIDER:/PATH", file=sys.stderr)
+                "[--jobs N] LOCAL_DIR PROVIDER:/PATH", file=sys.stderr)
             sys.exit(1)
 
         local_path = mirror_args[0]
@@ -1175,7 +1296,7 @@ def main():
                 sys.exit(1)
 
         success = mirror_directory(provider_config, local_path, s3_prefix,
-            remove_extra, overwrite_all)
+            remove_extra, overwrite_all, jobs)
         sys.exit(0 if success else 1)
 
     else:
