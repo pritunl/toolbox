@@ -128,9 +128,21 @@ CONFIGURATION FILE
             }},
             "my-r2": {{
                 "bucket": "r2-bucket",
-                "access_key": "...",
-                "secret_access_key": "...",
+                "access_key": "AKIAIOSFODNN7EXAMPLE",
+                "secret_access_key": "wJalrXUtnFEMI...",
                 "cloudflare_account_id": "a8f2b4e6d9c1f7a3..."
+            }},
+            "my-oracle": {{
+                "bucket": "oracle-bucket",
+                "access_key": "AKIAIOSFODNN7EXAMPLE",
+                "secret_access_key": "wJalrXUtnFEMI...",
+                "oracle_cloud_namespace": "ocidev"
+            }},
+            "my-vultr": {{
+                "bucket": "vultr-bucket",
+                "access_key": "AKIAIOSFODNN7EXAMPLE",
+                "secret_access_key": "wJalrXUtnFEMI...",
+                "domain": "ewr2.vultrobjects.com"
             }}
         }}
     }}
