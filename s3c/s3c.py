@@ -574,127 +574,11 @@ def download_file(config, s3_key, dest_file_path):
 
 def list_objects(config, prefix=""):
     host, uri = get_host_and_uri(config)
-
-    query_params = {"delimiter": "/"}
-    if prefix:
-        query_params["prefix"] = prefix
-
-    headers = create_auth_headers("GET", host, uri, config,
-        query_params=query_params)
-
-    conn = http.client.HTTPSConnection(host)
-
-    try:
-        query_string = ""
-        if query_params:
-            query_string = "?" + "&".join(f"{k}={urllib.parse.quote(str(v))}"
-                for k, v in query_params.items())
-
-        conn.request("GET", uri + query_string, headers=headers)
-        response = conn.getresponse()
-
-        if response.status != 200:
-            body = response.read().decode()
-            print(f"Error: {response.status} {response.reason}",
-                file=sys.stderr)
-            print(body, file=sys.stderr)
-            return False
-
-        body = response.read().decode()
-
-        try:
-            root = xml.etree.ElementTree.fromstring(body)
-
-            ns = ""
-            if root.tag.startswith("{"):
-                ns = "{" + root.tag.split("}")[0][1:] + "}"
-
-            items = []
-
-            for prefix_elem in root.findall(f"{ns}CommonPrefixes"):
-                prefix_key = prefix_elem.find(f"{ns}Prefix")
-                if prefix_key is not None:
-                    dir_name = prefix_key.text
-                    items.append({
-                        "key": dir_name,
-                        "size": None,
-                        "modified": "",
-                        "is_dir": True
-                    })
-
-            for content in root.findall(f"{ns}Contents"):
-                key_elem = content.find(f"{ns}Key")
-                size_elem = content.find(f"{ns}Size")
-                modified_elem = content.find(f"{ns}LastModified")
-
-                if key_elem is not None:
-                    key = key_elem.text
-                    size = int(size_elem.text) if size_elem is not None else 0
-                    modified = modified_elem.text if modified_elem \
-                        is not None else ""
-
-                    items.append({
-                        "key": key,
-                        "size": size,
-                        "modified": modified,
-                        "is_dir": False
-                    })
-
-            if not items:
-                print("No objects found")
-                return True
-
-            items.sort(key=lambda x: (not x["is_dir"], x["key"]))
-
-            for item in items:
-                if item["is_dir"]:
-                    dir_name = item["key"].rstrip("/") + "/"
-                    print(f"{'-':19} {'-':>8} {dir_name}")
-                else:
-                    size = item["size"]
-                    if size < 1024:
-                        size_str = f"{size}B"
-                    elif size < 1024 * 1024:
-                        size_str = f"{size / 1024:.1f}K"
-                    elif size < 1024 * 1024 * 1024:
-                        size_str = f"{size / (1024 * 1024):.1f}M"
-                    elif size < 1024 * 1024 * 1024 * 1024:
-                        size_str = f"{size / (1024 * 1024 * 1024):.1f}G"
-                    else:
-                        size_str = f"{size / (1024 * 1024 * 1024 * 1024):.1f}T"
-
-                    if item["modified"]:
-                        try:
-                            dt = datetime.datetime.fromisoformat(
-                                item["modified"].replace("Z", "+00:00"))
-                            modified_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-                        except:
-                            modified_str = item["modified"][:19]
-                        print(f"{modified_str:19} " +
-                            f"{size_str:>8} {item['key']}")
-                    else:
-                        print(f"{'-':19} {size_str:>8} {item['key']}")
-
-            return True
-
-        except xml.etree.ElementTree.ParseError as e:
-            print(f"Error parsing XML response: {e}", file=sys.stderr)
-            print(body, file=sys.stderr)
-            return False
-
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return False
-    finally:
-        conn.close()
-
-def list_objects_recursive(config, prefix=""):
-    host, uri = get_host_and_uri(config)
-    all_objects = []
+    all_items = []
     continuation_token = None
 
     while True:
-        query_params = {}
+        query_params = {"list-type": "2", "delimiter": "/"}
         if prefix:
             query_params["prefix"] = prefix
         if continuation_token:
@@ -709,7 +593,141 @@ def list_objects_recursive(config, prefix=""):
             query_string = ""
             if query_params:
                 query_string = "?" + "&".join(
-                    f"{k}={urllib.parse.quote(str(v))}"
+                    f"{k}={urllib.parse.quote(str(v), safe='')}"
+                    for k, v in query_params.items()
+                )
+
+            conn.request("GET", uri + query_string, headers=headers)
+            response = conn.getresponse()
+
+            if response.status != 200:
+                body = response.read().decode()
+                print(f"Error: {response.status} {response.reason}",
+                    file=sys.stderr)
+                print(body, file=sys.stderr)
+                return False
+
+            body = response.read().decode()
+
+            try:
+                root = xml.etree.ElementTree.fromstring(body)
+
+                ns = ""
+                if root.tag.startswith("{"):
+                    ns = "{" + root.tag.split("}")[0][1:] + "}"
+
+                for prefix_elem in root.findall(f"{ns}CommonPrefixes"):
+                    prefix_key = prefix_elem.find(f"{ns}Prefix")
+                    if prefix_key is not None:
+                        dir_name = prefix_key.text
+                        all_items.append({
+                            "key": dir_name,
+                            "size": None,
+                            "modified": "",
+                            "is_dir": True
+                        })
+
+                for content in root.findall(f"{ns}Contents"):
+                    key_elem = content.find(f"{ns}Key")
+                    size_elem = content.find(f"{ns}Size")
+                    modified_elem = content.find(f"{ns}LastModified")
+
+                    if key_elem is not None:
+                        key = key_elem.text
+                        size = int(size_elem.text) if \
+                            size_elem is not None else 0
+                        modified = modified_elem.text if \
+                            modified_elem is not None else ""
+
+                        all_items.append({
+                            "key": key,
+                            "size": size,
+                            "modified": modified,
+                            "is_dir": False
+                        })
+
+                is_truncated = root.find(f"{ns}IsTruncated")
+                if is_truncated is not None and is_truncated.text == "true":
+                    next_token = root.find(f"{ns}NextContinuationToken")
+                    if next_token is not None:
+                        continuation_token = next_token.text
+                    else:
+                        break
+                else:
+                    break
+
+            except xml.etree.ElementTree.ParseError as e:
+                print(f"Error parsing XML response: {e}", file=sys.stderr)
+                print(body, file=sys.stderr)
+                return False
+
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return False
+        finally:
+            conn.close()
+
+    if not all_items:
+        print("No objects found")
+        return True
+
+    all_items.sort(key=lambda x: (not x["is_dir"], x["key"]))
+
+    for item in all_items:
+        if item["is_dir"]:
+            dir_name = item["key"].rstrip("/") + "/"
+            print(f"{'-':19} {'-':>8} {dir_name}")
+        else:
+            size = item["size"]
+            if size < 1024:
+                size_str = f"{size}B"
+            elif size < 1024 * 1024:
+                size_str = f"{size / 1024:.1f}K"
+            elif size < 1024 * 1024 * 1024:
+                size_str = f"{size / (1024 * 1024):.1f}M"
+            elif size < 1024 * 1024 * 1024 * 1024:
+                size_str = f"{size / (1024 * 1024 * 1024):.1f}G"
+            else:
+                size_str = f"{size / (1024 * 1024 * 1024 * 1024):.1f}T"
+
+            if item["modified"]:
+                try:
+                    dt = datetime.datetime.fromisoformat(
+                        item["modified"].replace("Z", "+00:00"))
+                    modified_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    modified_str = item["modified"][:19]
+                print(f"{modified_str:19} " +
+                    f"{size_str:>8} {item['key']}")
+            else:
+                print(f"{'-':19} {size_str:>8} {item['key']}")
+
+    return True
+
+def list_objects_recursive(config, prefix=""):
+    host, uri = get_host_and_uri(config)
+    all_objects = []
+    continuation_token = None
+    page_count = 0
+
+    while True:
+        page_count += 1
+        query_params = {"list-type": "2"}  # Use ListObjectsV2 API
+        if prefix:
+            query_params["prefix"] = prefix
+        if continuation_token:
+            query_params["continuation-token"] = continuation_token
+
+        headers = create_auth_headers("GET", host, uri, config,
+            query_params=query_params)
+
+        conn = http.client.HTTPSConnection(host)
+
+        try:
+            query_string = ""
+            if query_params:
+                query_string = "?" + "&".join(
+                    f"{k}={urllib.parse.quote(str(v), safe='')}"
                     for k, v in query_params.items()
                 )
 
@@ -732,6 +750,7 @@ def list_objects_recursive(config, prefix=""):
                 if root.tag.startswith("{"):
                     ns = "{" + root.tag.split("}")[0][1:] + "}"
 
+                page_objects = 0
                 for content in root.findall(f"{ns}Contents"):
                     key_elem = content.find(f"{ns}Key")
                     size_elem = content.find(f"{ns}Size")
@@ -749,15 +768,22 @@ def list_objects_recursive(config, prefix=""):
                             "size": size,
                             "modified": modified
                         })
+                        page_objects += 1
+
+                print(f"Fetched page {page_count}: {page_objects} objects " +
+                      f"(total so far: {len(all_objects)})")
 
                 is_truncated = root.find(f"{ns}IsTruncated")
                 if is_truncated is not None and is_truncated.text == "true":
                     next_token = root.find(f"{ns}NextContinuationToken")
                     if next_token is not None:
                         continuation_token = next_token.text
+                        print(f"Response is truncated, fetching next page...")
                     else:
+                        print(f"Response is truncated but no continuation token found!")
                         break
                 else:
+                    print(f"All objects fetched successfully")
                     break
 
             except xml.etree.ElementTree.ParseError as e:
