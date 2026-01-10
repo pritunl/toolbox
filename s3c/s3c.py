@@ -84,24 +84,26 @@ COMMANDS
     ls PROVIDER:[PATH]
         List objects in S3-compatible storage
 
-        List bucket:     {program_name} ls provider:
-        List folder:     {program_name} ls provider:/folder/
+        List bucket: {program_name} ls provider:
+        List folder: {program_name} ls provider:/folder/
 
     rm PROVIDER:/PATH
         Remove object from S3-compatible storage.
 
-        Remove file:     {program_name} rm provider:/path/file.tar
+        Remove file: {program_name} rm provider:/path/file.tar
 
-    mirror [--remove] LOCAL_DIR PROVIDER:/PATH
+    mirror [--remove] [--overwrite] LOCAL_DIR PROVIDER:/PATH
         Mirror a local directory to S3, syncing based on modification times.
         Files are uploaded if they don't exist on S3 or local modification
         time is newer than S3 modification time. Files are skipped if S3
         modification time is equal to or newer than local modification time.
 
         --remove: Delete files on S3 that don't exist locally
+        --overwrite: Upload all files regardless of modification time
 
-        Example:     {program_name} mirror ./dist provider:/website/
-        With remove: {program_name} mirror --remove ./dist provider:/website/
+        Example: {program_name} mirror ./dist/ provider:/website/
+                 {program_name} mirror --remove ./dist/ provider:/website/
+                 {program_name} mirror --overwrite ./dist/ provider:/website/
 
     add-provider
         Interactively add a new provider configuration.
@@ -187,6 +189,9 @@ EXAMPLES
 
     List objects in folder:
         {program_name} ls my-bucket:/archives/
+
+    Mirror folder to bucket:
+        {program_name} mirror ./data/ my-bucket:/data/
 
     Remove object:
         {program_name} rm my-bucket:/archives/old-file.tar
@@ -796,7 +801,8 @@ def remove_object(config, s3_key):
     finally:
         conn.close()
 
-def mirror_directory(config, local_path, s3_prefix, remove_extra=False):
+def mirror_directory(config, local_path, s3_prefix,
+        remove_extra=False, overwrite=False):
     if not os.path.isdir(local_path):
         print(f"Error: Local path '{local_path}' is not a directory",
             file=sys.stderr)
@@ -866,11 +872,14 @@ def mirror_directory(config, local_path, s3_prefix, remove_extra=False):
         if rel_path in remote_files:
             remote_info = remote_files[rel_path]
 
-            time_diff = local_info["mtime"] - remote_info["mtime"]
-            if time_diff > -10:
+            if overwrite:
                 files_to_upload.append(rel_path)
             else:
-                files_to_skip.append(rel_path)
+                time_diff = local_info["mtime"] - remote_info["mtime"]
+                if time_diff > -10:
+                    files_to_upload.append(rel_path)
+                else:
+                    files_to_skip.append(rel_path)
         else:
             files_to_upload.append(rel_path)
 
@@ -969,7 +978,7 @@ def main():
         print(f"   or: {program_name} [OPTIONS] rm PROVIDER:/PATH",
             file=sys.stderr)
         print(f"   or: {program_name} [OPTIONS] mirror [--remove] " +
-            "LOCAL_DIR PROVIDER:/PATH", file=sys.stderr)
+            "[--overwrite] LOCAL_DIR PROVIDER:/PATH", file=sys.stderr)
         print(f"   or: {program_name} [OPTIONS] add-provider",
             file=sys.stderr)
         print(f"Try '{program_name} --help' for more information",
@@ -1089,15 +1098,24 @@ def main():
 
     elif command == "mirror":
         remove_extra = False
+        overwrite_all = False
         mirror_args = args[1:]
 
-        if mirror_args and mirror_args[0] == "--remove":
-            remove_extra = True
-            mirror_args = mirror_args[1:]
+        while mirror_args and mirror_args[0].startswith("--"):
+            if mirror_args[0] == "--remove":
+                remove_extra = True
+                mirror_args = mirror_args[1:]
+            elif mirror_args[0] == "--overwrite":
+                overwrite_all = True
+                mirror_args = mirror_args[1:]
+            else:
+                print(f"Error: Unknown option '{mirror_args[0]}'",
+                    file=sys.stderr)
+                sys.exit(1)
 
         if len(mirror_args) != 2:
-            print(f"Usage: {program_name} mirror [--remove] LOCAL_DIR " +
-                "PROVIDER:/PATH", file=sys.stderr)
+            print(f"Usage: {program_name} mirror [--remove] [--overwrite] " +
+                "LOCAL_DIR PROVIDER:/PATH", file=sys.stderr)
             sys.exit(1)
 
         local_path = mirror_args[0]
@@ -1123,7 +1141,7 @@ def main():
                 sys.exit(1)
 
         success = mirror_directory(provider_config, local_path, s3_prefix,
-            remove_extra)
+            remove_extra, overwrite_all)
         sys.exit(0 if success else 1)
 
     else:
