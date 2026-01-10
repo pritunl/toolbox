@@ -63,7 +63,7 @@ def print_help():
     print(f"""{program_name} - transfers files with S3-compatible storage
 
 Usage: {program_name} [OPTIONS] cp SOURCE DESTINATION
-  or   {program_name} [OPTIONS] ls PROVIDER:[PATH]
+  or   {program_name} [OPTIONS] ls [--recursive] PROVIDER:[PATH]
   or   {program_name} [OPTIONS] rm PROVIDER:/PATH
   or   {program_name} [OPTIONS] mirror [--remove] LOCAL_DIR PROVIDER:/PATH
   or   {program_name} [OPTIONS] add-provider
@@ -81,11 +81,14 @@ COMMANDS
         Upload:   {program_name} cp ./file.tar provider:/path/file.tar
         Download: {program_name} cp provider:/path/file.tar ./file.tar
 
-    ls PROVIDER:[PATH]
+    ls [--recursive] PROVIDER:[PATH]
         List objects in S3-compatible storage
 
-        List bucket: {program_name} ls provider:
-        List folder: {program_name} ls provider:/folder/
+        --recursive: List all objects recursively (no folder grouping)
+
+        Example: {program_name} ls provider:
+                 {program_name} ls provider:/folder/
+                 {program_name} ls --recursive provider:/folder/
 
     rm PROVIDER:/PATH
         Remove object from S3-compatible storage.
@@ -572,13 +575,15 @@ def download_file(config, s3_key, dest_file_path):
     finally:
         conn.close()
 
-def list_objects(config, prefix=""):
+def list_objects(config, prefix="", recursive=False):
     host, uri = get_host_and_uri(config)
     all_items = []
     continuation_token = None
 
     while True:
-        query_params = {"list-type": "2", "delimiter": "/"}
+        query_params = {"list-type": "2"}
+        if not recursive:
+            query_params["delimiter"] = "/"
         if prefix:
             query_params["prefix"] = prefix
         if continuation_token:
@@ -704,7 +709,7 @@ def list_objects(config, prefix=""):
 
     return True
 
-def list_objects_recursive(config, prefix=""):
+def get_objects_recursive(config, prefix=""):
     host, uri = get_host_and_uri(config)
     all_objects = []
     continuation_token = None
@@ -712,7 +717,7 @@ def list_objects_recursive(config, prefix=""):
 
     while True:
         page_count += 1
-        query_params = {"list-type": "2"}  # Use ListObjectsV2 API
+        query_params = {"list-type": "2"}
         if prefix:
             query_params["prefix"] = prefix
         if continuation_token:
@@ -770,20 +775,16 @@ def list_objects_recursive(config, prefix=""):
                         })
                         page_objects += 1
 
-                print(f"Fetched page {page_count}: {page_objects} objects " +
-                      f"(total so far: {len(all_objects)})")
-
                 is_truncated = root.find(f"{ns}IsTruncated")
                 if is_truncated is not None and is_truncated.text == "true":
                     next_token = root.find(f"{ns}NextContinuationToken")
                     if next_token is not None:
                         continuation_token = next_token.text
-                        print(f"Response is truncated, fetching next page...")
                     else:
-                        print(f"Response is truncated but no continuation token found!")
+                        print(f"Response is truncated but " +
+                            "no continuation token found!")
                         break
                 else:
-                    print(f"All objects fetched successfully")
                     break
 
             except xml.etree.ElementTree.ParseError as e:
@@ -855,7 +856,7 @@ def mirror_directory(config, local_path, s3_prefix,
     print(f"Found {len(local_files)} local files")
     print(f"Listing remote objects with prefix: {s3_prefix}")
 
-    remote_objects = list_objects_recursive(config, s3_prefix)
+    remote_objects = get_objects_recursive(config, s3_prefix)
     if remote_objects is None:
         print("Error: Failed to list remote objects", file=sys.stderr)
         return False
@@ -1065,12 +1066,19 @@ def main():
         sys.exit(0 if success else 1)
 
     elif command == "ls":
-        if len(args) != 2:
-            print(f"Usage: {program_name} ls PROVIDER:[PATH]",
+        recursive = False
+        ls_args = args[1:]
+
+        if ls_args and ls_args[0] == "--recursive":
+            recursive = True
+            ls_args = ls_args[1:]
+
+        if len(ls_args) != 1:
+            print(f"Usage: {program_name} ls [--recursive] PROVIDER:[PATH]",
                 file=sys.stderr)
             sys.exit(1)
 
-        path = args[1]
+        path = ls_args[0]
         provider, prefix = parse_s3_path(path)
 
         if not provider:
@@ -1090,7 +1098,7 @@ def main():
                     file=sys.stderr)
                 sys.exit(1)
 
-        success = list_objects(provider_config, prefix)
+        success = list_objects(provider_config, prefix, recursive)
         sys.exit(0 if success else 1)
 
     elif command == "rm":
