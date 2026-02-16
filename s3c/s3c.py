@@ -68,6 +68,7 @@ Usage: {program_name} [OPTIONS] cp SOURCE DESTINATION
   or   {program_name} [OPTIONS] ls [--recursive] PROVIDER:[PATH]
   or   {program_name} [OPTIONS] rm PROVIDER:/PATH
   or   {program_name} [OPTIONS] mirror [--remove] [--overwrite] [--jobs N] LOCAL_DIR PROVIDER:/PATH
+  or   {program_name} [OPTIONS] index PROVIDER:[PATH]
   or   {program_name} [OPTIONS] add-provider
   or   {program_name} --help
 
@@ -111,6 +112,12 @@ COMMANDS
                  {program_name} mirror --remove ./dist/ provider:/website/
                  {program_name} mirror --overwrite ./dist/ provider:/website/
                  {program_name} mirror --jobs 4 ./dist/ provider:/website/
+
+    index PROVIDER:[PATH]
+        Generate index.html files recursively and upload them to storage.
+
+        Example: {program_name} index provider:
+                 {program_name} index provider:/subdir/
 
     add-provider
         Interactively add a new provider configuration.
@@ -1070,6 +1077,179 @@ def mirror_directory(config, local_path, s3_prefix,
 
     return upload_failed == 0 and remove_failed == 0
 
+def upload_bytes(config, content, s3_key, content_type="text/html"):
+    host, uri = get_host_and_uri(config, s3_key)
+    payload_hash = hashlib.sha256(content).hexdigest()
+
+    headers = create_auth_headers("PUT", host, uri, config, content_type,
+        len(content), payload_hash)
+
+    conn = http.client.HTTPSConnection(host)
+
+    try:
+        conn.request("PUT", uri, body=content, headers=headers)
+        response = conn.getresponse()
+
+        if response.status >= 300:
+            body = response.read().decode()
+            print(f"Error: {response.status} {response.reason}",
+                file=sys.stderr)
+            print(body, file=sys.stderr)
+            return False
+        return True
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return False
+    finally:
+        conn.close()
+
+def _build_index_html(entries, display_path):
+    html = (f"<html><head><title>Index of /{display_path}</title></head>\n"
+        f"<body bgcolor=\"white\">\n"
+        f"<h1>Index of /{display_path}</h1><hr><pre>"
+        f"<a href=\"../\">../</a>\n")
+
+    for entry in entries:
+        name = entry["name"]
+        modified = entry["modified"]
+
+        label = name if len(name) <= 50 else name[:47] + "..>"
+
+        if entry["is_dir"]:
+            size_str = "-"
+        else:
+            size = entry["size"]
+            if size < 1024:
+                size_str = f"{size}B"
+            elif size < 1024 * 1024:
+                size_str = f"{size / 1024:.1f}K"
+            elif size < 1024 * 1024 * 1024:
+                size_str = f"{size / (1024 * 1024):.1f}M"
+            elif size < 1024 * 1024 * 1024 * 1024:
+                size_str = f"{size / (1024 * 1024 * 1024):.1f}G"
+            else:
+                size_str = f"{size / (1024 * 1024 * 1024 * 1024):.1f}T"
+
+        padding = " " * (51 - len(label))
+        html += (f"<a href=\"{name}\">{label}</a>"
+            f"{padding}{modified}{size_str:>21}\n")
+
+    html += "</pre><hr>\n</body></html>\n"
+    return html
+
+def generate_indexes(config, prefix=""):
+    print("Listing objects recursively...")
+    all_objects = get_objects_recursive(config, prefix)
+    if all_objects is None:
+        print("Error: Failed to list objects", file=sys.stderr)
+        return False
+
+    print(f"Found {len(all_objects)} objects")
+
+    dirs = {}
+
+    for obj in all_objects:
+        key = obj["key"]
+
+        if prefix:
+            rel = key[len(prefix):]
+            if rel.startswith("/"):
+                rel = rel[1:]
+        else:
+            rel = key
+
+        if rel == "index.html" or rel.endswith("/index.html"):
+            continue
+
+        parts = rel.split("/")
+        filename = parts[-1]
+        if not filename:
+            continue
+
+        if len(parts) > 1:
+            dir_path = "/".join(parts[:-1]) + "/"
+        else:
+            dir_path = ""
+
+        if dir_path not in dirs:
+            dirs[dir_path] = {"files": [], "subdirs": set()}
+
+        modified_str = ""
+        if obj["modified"]:
+            try:
+                dt = datetime.datetime.fromisoformat(
+                    obj["modified"].replace("Z", "+00:00"))
+                modified_str = dt.strftime("%d-%b-%Y %H:%M")
+            except:
+                modified_str = obj["modified"][:16]
+
+        dirs[dir_path]["files"].append({
+            "name": filename,
+            "size": obj["size"],
+            "modified": modified_str
+        })
+
+        for i in range(len(parts) - 1):
+            parent = "/".join(parts[:i]) + "/" if i > 0 else ""
+            subdir_name = parts[i] + "/"
+
+            if parent not in dirs:
+                dirs[parent] = {"files": [], "subdirs": set()}
+            dirs[parent]["subdirs"].add(subdir_name)
+
+            child = "/".join(parts[:i + 1]) + "/"
+            if child not in dirs:
+                dirs[child] = {"files": [], "subdirs": set()}
+
+    if not dirs:
+        print("No objects found")
+        return True
+
+    total = len(dirs)
+    success = 0
+    failed = 0
+
+    for dir_path in sorted(dirs.keys()):
+        info = dirs[dir_path]
+
+        if prefix:
+            display = prefix.rstrip("/")
+            if dir_path:
+                display += "/" + dir_path.rstrip("/")
+        else:
+            display = dir_path.rstrip("/")
+
+        entries = []
+        for subdir in sorted(info["subdirs"]):
+            entries.append({"name": subdir, "is_dir": True,
+                "size": 0, "modified": "-"})
+        for f in sorted(info["files"], key=lambda x: x["name"]):
+            entries.append({"name": f["name"], "is_dir": False,
+                "size": f["size"], "modified": f["modified"]})
+
+        html = _build_index_html(entries, display)
+
+        if prefix:
+            s3_key = prefix
+            if not s3_key.endswith("/"):
+                s3_key += "/"
+        else:
+            s3_key = ""
+        s3_key += dir_path + "index.html"
+
+        print(f"  Uploading: {s3_key}")
+        if upload_bytes(config, html.encode("utf-8"), s3_key):
+            success += 1
+        else:
+            failed += 1
+
+    print(f"\nIndex generation complete:")
+    print(f"  Generated: {success}/{total}")
+    if failed > 0:
+        print(f"  Failed: {failed}")
+
+    return failed == 0
+
 def parse_s3_path(path):
     if ":" not in path:
         return None, None
@@ -1109,6 +1289,8 @@ def main():
             file=sys.stderr)
         print(f"   or: {program_name} [OPTIONS] mirror [--remove] " +
             "[--overwrite] [--jobs N] LOCAL_DIR PROVIDER:/PATH",
+            file=sys.stderr)
+        print(f"   or: {program_name} [OPTIONS] index PROVIDER:[PATH]",
             file=sys.stderr)
         print(f"   or: {program_name} [OPTIONS] add-provider",
             file=sys.stderr)
@@ -1297,6 +1479,35 @@ def main():
 
         success = mirror_directory(provider_config, local_path, s3_prefix,
             remove_extra, overwrite_all, jobs)
+        sys.exit(0 if success else 1)
+
+    elif command == "index":
+        if len(args) != 2:
+            print(f"Usage: {program_name} index PROVIDER:[PATH]",
+                file=sys.stderr)
+            sys.exit(1)
+
+        path = args[1]
+        provider, prefix = parse_s3_path(path)
+
+        if not provider:
+            print("Error: Path must be in provider:[path] format",
+                file=sys.stderr)
+            sys.exit(1)
+
+        config = load_config(config_path)
+        provider_config = get_provider_config(provider, config)
+
+        if not provider_config:
+            provider_config = get_credentials_from_env(provider)
+            if (not provider_config["access_key"] or
+                not provider_config["secret_access_key"]):
+                print(f"Error: No configuration found for provider " +
+                    f"'{provider}' and no environment variables set",
+                    file=sys.stderr)
+                sys.exit(1)
+
+        success = generate_indexes(provider_config, prefix)
         sys.exit(0 if success else 1)
 
     else:
