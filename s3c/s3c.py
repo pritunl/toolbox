@@ -13,6 +13,9 @@ import xml.etree.ElementTree
 import threading
 import queue
 
+MULTIPART_THRESHOLD = 4 * 1024 * 1024 * 1024
+MULTIPART_PART_SIZE = 512 * 1024 * 1024
+
 content_types = {
     ".html": "text/html",
     ".htm": "text/html",
@@ -254,7 +257,7 @@ class ProgressTracker:
             self.last_print = now
 
 class ProgressFileReader:
-    def __init__(self, file_path, chunk_size=8192):
+    def __init__(self, file_path, chunk_size=1048576):
         self.file = open(file_path, "rb")
         self.file_path = file_path
         self.total_size = os.path.getsize(file_path)
@@ -273,6 +276,30 @@ class ProgressFileReader:
 
     def close(self):
         self.file.close()
+
+class FileSliceReader:
+    def __init__(self, file_obj, offset, length, chunk_size=1048576):
+        self.file = file_obj
+        self.offset = offset
+        self.length = length
+        self.chunk_size = chunk_size
+        self.bytes_read = 0
+        self.file.seek(self.offset)
+
+    def read(self, size=-1):
+        remaining = self.length - self.bytes_read
+        if remaining <= 0:
+            return b""
+        if size <= 0:
+            size = self.chunk_size
+        to_read = min(size, remaining)
+        data = self.file.read(to_read)
+        if data:
+            self.bytes_read += len(data)
+        return data
+
+    def __len__(self):
+        return self.length
 
 def get_utc_now():
     try:
@@ -407,7 +434,7 @@ def get_signature_key(key, date_stamp, region, service):
 def sha256_hexdigest_file(file_path):
     h = hashlib.sha256()
     with open(file_path, "rb") as f:
-        while chunk := f.read(8192):
+        while chunk := f.read(1048576):
             h.update(chunk)
     return h.hexdigest()
 
@@ -503,17 +530,242 @@ def create_auth_headers(method, host, uri, config, content_type=None,
 
     return headers_dict
 
+def multipart_create(config, host, uri, content_type):
+    query_params = {"uploads": ""}
+
+    headers = create_auth_headers("POST", host, uri, config,
+        content_type=content_type, payload_hash=hashlib.sha256(
+            b"").hexdigest(), query_params=query_params)
+
+    conn = http.client.HTTPSConnection(host)
+
+    try:
+        conn.request("POST", uri + "?uploads", headers=headers)
+        response = conn.getresponse()
+        body = response.read().decode()
+
+        if response.status != 200:
+            print(f"Error creating multipart upload: "
+                f"{response.status} {response.reason}", file=sys.stderr)
+            print(body, file=sys.stderr)
+            return None
+
+        root = xml.etree.ElementTree.fromstring(body)
+        ns = ""
+        if root.tag.startswith("{"):
+            ns = "{" + root.tag.split("}")[0][1:] + "}"
+
+        upload_id_elem = root.find(f"{ns}UploadId")
+        if upload_id_elem is None:
+            print("Error: No UploadId in response", file=sys.stderr)
+            return None
+
+        return upload_id_elem.text
+
+    except Exception as e:
+        print(f"Error creating multipart upload: {e}", file=sys.stderr)
+        return None
+    finally:
+        conn.close()
+
+def multipart_upload_part(config, host, uri, upload_id, part_number,
+        file_obj, part_offset, part_size):
+    h = hashlib.sha256()
+    file_obj.seek(part_offset)
+    remaining = part_size
+    while remaining > 0:
+        chunk = file_obj.read(min(1048576, remaining))
+        if not chunk:
+            break
+        h.update(chunk)
+        remaining -= len(chunk)
+    payload_hash = h.hexdigest()
+
+    query_params = {
+        "partNumber": str(part_number),
+        "uploadId": upload_id,
+    }
+
+    headers = create_auth_headers("PUT", host, uri, config,
+        content_length=part_size, payload_hash=payload_hash,
+        query_params=query_params)
+
+    query_string = (f"?partNumber={part_number}"
+        f"&uploadId={urllib.parse.quote(upload_id, safe='')}")
+
+    reader = FileSliceReader(file_obj, part_offset, part_size)
+
+    conn = http.client.HTTPSConnection(host)
+
+    try:
+        conn.request("PUT", uri + query_string, body=reader,
+            headers=headers)
+        response = conn.getresponse()
+        response.read()
+
+        if response.status != 200:
+            print(f"Error uploading part {part_number}: "
+                f"{response.status} {response.reason}", file=sys.stderr)
+            return None
+
+        etag = response.getheader("ETag")
+        if not etag:
+            print(f"Error: No ETag in response for part {part_number}",
+                file=sys.stderr)
+            return None
+
+        return etag
+
+    except Exception as e:
+        print(f"Error uploading part {part_number}: {e}", file=sys.stderr)
+        return None
+    finally:
+        conn.close()
+
+def multipart_complete(config, host, uri, upload_id, parts):
+    query_params = {"uploadId": upload_id}
+
+    parts_xml = "<CompleteMultipartUpload>"
+    for part_number, etag in parts:
+        parts_xml += (f"<Part>"
+            f"<PartNumber>{part_number}</PartNumber>"
+            f"<ETag>{etag}</ETag>"
+            f"</Part>")
+    parts_xml += "</CompleteMultipartUpload>"
+
+    payload = parts_xml.encode("utf-8")
+    payload_hash = hashlib.sha256(payload).hexdigest()
+
+    headers = create_auth_headers("POST", host, uri, config,
+        content_type="application/xml", content_length=len(payload),
+        payload_hash=payload_hash, query_params=query_params)
+
+    query_string = f"?uploadId={urllib.parse.quote(upload_id, safe='')}"
+
+    conn = http.client.HTTPSConnection(host)
+
+    try:
+        conn.request("POST", uri + query_string, body=payload,
+            headers=headers)
+        response = conn.getresponse()
+        body = response.read().decode()
+
+        if response.status != 200:
+            print(f"Error completing multipart upload: "
+                f"{response.status} {response.reason}", file=sys.stderr)
+            print(body, file=sys.stderr)
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f"Error completing multipart upload: {e}", file=sys.stderr)
+        return False
+    finally:
+        conn.close()
+
+def multipart_abort(config, host, uri, upload_id):
+    query_params = {"uploadId": upload_id}
+
+    headers = create_auth_headers("DELETE", host, uri, config,
+        query_params=query_params)
+
+    query_string = f"?uploadId={urllib.parse.quote(upload_id, safe='')}"
+
+    conn = http.client.HTTPSConnection(host)
+
+    try:
+        conn.request("DELETE", uri + query_string, headers=headers)
+        response = conn.getresponse()
+        response.read()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+def upload_file_multipart(config, source_file_path, s3_key,
+        show_progress=True):
+    host, uri = get_host_and_uri(config, s3_key)
+
+    ext = os.path.splitext(source_file_path)[1].lower()
+    content_type = content_types.get(ext, "application/octet-stream")
+    file_size = os.path.getsize(source_file_path)
+
+    if show_progress:
+        print(f"Uploading to: {host} (multipart)")
+
+    upload_id = multipart_create(config, host, uri, content_type)
+    if not upload_id:
+        return False
+
+    if show_progress:
+        tracker = ProgressTracker(file_size,
+            f"Uploading {os.path.basename(source_file_path)}")
+
+    parts = []
+    part_number = 1
+
+    try:
+        with open(source_file_path, "rb") as f:
+            offset = 0
+            while offset < file_size:
+                part_size = min(MULTIPART_PART_SIZE, file_size - offset)
+
+                etag = multipart_upload_part(config, host, uri,
+                    upload_id, part_number, f, offset, part_size)
+
+                if not etag:
+                    print(f"\nError: Failed on part {part_number}, "
+                        "aborting upload", file=sys.stderr)
+                    multipart_abort(config, host, uri, upload_id)
+                    return False
+
+                parts.append((part_number, etag))
+
+                if show_progress:
+                    tracker.update(part_size)
+
+                offset += part_size
+                part_number += 1
+
+        success = multipart_complete(config, host, uri, upload_id, parts)
+
+        if show_progress:
+            if success:
+                print(f"\nUpload successful: "
+                    f"{config['bucket']}/{s3_key} "
+                    f"({len(parts)} parts)")
+            else:
+                print(f"\nError: Failed to complete multipart upload",
+                    file=sys.stderr)
+
+        if not success:
+            multipart_abort(config, host, uri, upload_id)
+
+        return success
+
+    except Exception as e:
+        if show_progress:
+            print(f"\nError: {e}", file=sys.stderr)
+        multipart_abort(config, host, uri, upload_id)
+        return False
+
 def upload_file(config, source_file_path, s3_key, show_progress=True):
     if not os.path.isfile(source_file_path):
         print(f"Error: Source file '{source_file_path}' not found",
             file=sys.stderr)
         return False
 
+    content_length = os.path.getsize(source_file_path)
+
+    if content_length >= MULTIPART_THRESHOLD:
+        return upload_file_multipart(config, source_file_path, s3_key,
+            show_progress)
+
     host, uri = get_host_and_uri(config, s3_key)
 
     ext = os.path.splitext(source_file_path)[1].lower()
     content_type = content_types.get(ext, "application/octet-stream")
-    content_length = os.path.getsize(source_file_path)
     payload_hash = sha256_hexdigest_file(source_file_path)
 
     headers = create_auth_headers("PUT", host, uri, config, content_type,
@@ -582,7 +834,7 @@ def download_file(config, s3_key, dest_file_path):
 
         with open(dest_file_path, "wb") as f:
             while True:
-                chunk = response.read(8192)
+                chunk = response.read(1048576)
                 if not chunk:
                     break
                 f.write(chunk)
