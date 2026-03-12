@@ -130,6 +130,9 @@ def _compile_patterns(patterns: typing.List[str]):
 
     return match_any
 
+def _escape_rsync_pattern(path: str) -> str:
+    return path.replace("[", "\\[").replace("]", "\\]")
+
 def _sync(
     source: str,
     destinations: typing.List[str],
@@ -266,10 +269,12 @@ def _sync_once(
                 for i in range(len(path_parts)):
                     parent = "/".join(path_parts[:i+1])
                     if parent and parent not in included_paths:
-                        filter_file.write(f"+ /{parent}\n")
+                        filter_file.write(
+                            f"+ /{_escape_rsync_pattern(parent)}\n")
                         included_paths.add(parent)
 
-                filter_file.write(f"+ /{filepath}\n")
+                filter_file.write(
+                    f"+ /{_escape_rsync_pattern(filepath)}\n")
 
             filter_file.write("- *\n")
             filter_file.close()
