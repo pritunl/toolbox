@@ -849,7 +849,7 @@ def download_file(config, s3_key, dest_file_path):
     finally:
         conn.close()
 
-def list_objects(config, prefix="", recursive=False):
+def get_objects(config, prefix="", recursive=False):
     host, uri = get_host_and_uri(config)
     all_items = []
     continuation_token = None
@@ -884,7 +884,7 @@ def list_objects(config, prefix="", recursive=False):
                 print(f"Error: {response.status} {response.reason}",
                     file=sys.stderr)
                 print(body, file=sys.stderr)
-                return False
+                return None
 
             body = response.read().decode()
 
@@ -938,19 +938,27 @@ def list_objects(config, prefix="", recursive=False):
             except xml.etree.ElementTree.ParseError as e:
                 print(f"Error parsing XML response: {e}", file=sys.stderr)
                 print(body, file=sys.stderr)
-                return False
+                return None
 
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
-            return False
+            return None
         finally:
             conn.close()
+
+    all_items.sort(key=lambda x: (not x["is_dir"], x["key"]))
+
+    return all_items
+
+def list_objects(config, prefix="", recursive=False):
+    all_items = get_objects(config, prefix=prefix, recursive=recursive)
+
+    if all_items is None:
+        return False
 
     if not all_items:
         print("No objects found")
         return True
-
-    all_items.sort(key=lambda x: (not x["is_dir"], x["key"]))
 
     for item in all_items:
         if item["is_dir"]:
