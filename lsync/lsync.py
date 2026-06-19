@@ -225,8 +225,6 @@ def _sync(
                 if changes_set and (current_time - last_sync) >= batch_delay:
                     changes = []
                     for change in changes_set:
-                        if "balancer" in change[1]:
-                            continue
                         if exclude_matcher(change[1]):
                             continue
                         changes.append(change)
