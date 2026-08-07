@@ -1,14 +1,16 @@
-FROM oraclelinux:9-slim
+FROM registry.access.redhat.com/ubi10/ubi-minimal:latest
 
 RUN microdnf -y update
+RUN microdnf -y install shadow-utils
 RUN groupadd --gid 277 --system mongodb
 RUN useradd --uid 277 --system --gid mongodb --home-dir /data/db mongodb
+RUN microdnf -y remove shadow-utils
 RUN mkdir -p /data/db
 RUN chown -R mongodb:mongodb /data/db
 
 RUN echo $'[mongodb-org]\n\
 name=MongoDB Repository\n\
-baseurl=https://repo.mongodb.org/yum/redhat/9/mongodb-org/8.0/x86_64/\n\
+baseurl=https://repo.mongodb.org/yum/redhat/10/mongodb-org/8.3/x86_64/\n\
 gpgcheck=1\n\
 enabled=1\n\
 gpgkey=https://www.mongodb.org/static/pgp/server-8.0.asc\n' > /etc/yum.repos.d/mongo.repo
