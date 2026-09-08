@@ -4,6 +4,7 @@ import os
 import datetime
 import hashlib
 import hmac
+import base64
 import time
 import json
 import getpass
@@ -69,9 +70,9 @@ def print_help():
 
 Usage: {program_name} [OPTIONS] cp SOURCE DESTINATION
   or   {program_name} [OPTIONS] ls [--recursive] PROVIDER:[PATH]
-  or   {program_name} [OPTIONS] rm PROVIDER:/PATH
+  or   {program_name} [OPTIONS] rm [--recursive] PROVIDER:/PATH
   or   {program_name} [OPTIONS] mirror [--remove] [--overwrite] [--jobs N] LOCAL_DIR PROVIDER:/PATH
-  or   {program_name} [OPTIONS] index PROVIDER:[PATH]
+  or   {program_name} [OPTIONS] index [--jobs N] PROVIDER:[PATH]
   or   {program_name} [OPTIONS] add-provider
   or   {program_name} --help
 
@@ -96,10 +97,14 @@ COMMANDS
                  {program_name} ls provider:/folder/
                  {program_name} ls --recursive provider:/folder/
 
-    rm PROVIDER:/PATH
+    rm [--recursive] PROVIDER:/PATH
         Remove object from S3-compatible storage.
 
+        --recursive: Remove all objects under the path prefix using
+                     batched multi-object delete requests
+
         Remove file: {program_name} rm provider:/path/file.tar
+        Remove dir:  {program_name} rm --recursive provider:/path/folder/
 
     mirror [--remove] [--overwrite] [--jobs N] LOCAL_DIR PROVIDER:/PATH
         Mirror a local directory to S3, syncing based on modification times.
@@ -116,11 +121,14 @@ COMMANDS
                  {program_name} mirror --overwrite ./dist/ provider:/website/
                  {program_name} mirror --jobs 4 ./dist/ provider:/website/
 
-    index PROVIDER:[PATH]
+    index [--jobs N] PROVIDER:[PATH]
         Generate index.html files recursively and upload them to storage.
+
+        --jobs N: Upload N index files in parallel (default: 1)
 
         Example: {program_name} index provider:
                  {program_name} index provider:/subdir/
+                 {program_name} index --jobs 8 provider:/subdir/
 
     add-provider
         Interactively add a new provider configuration.
@@ -454,13 +462,15 @@ def get_host_and_uri(config, s3_key=""):
         host = f"s3.{region}.amazonaws.com"
 
     if s3_key:
-        uri = f"/{config['bucket']}/{s3_key}"
+        encoded_key = urllib.parse.quote(s3_key, safe="/")
+        uri = f"/{config['bucket']}/{encoded_key}"
     else:
         uri = f"/{config['bucket']}/"
     return host, uri
 
 def create_auth_headers(method, host, uri, config, content_type=None,
-        content_length=None, payload_hash=None, query_params=None):
+        content_length=None, payload_hash=None, query_params=None,
+        extra_headers=None):
     access_key = config["access_key"]
     secret_key = config["secret_access_key"]
     region = config.get("region", "us-east-1")
@@ -484,6 +494,9 @@ def create_auth_headers(method, host, uri, config, content_type=None,
         headers_dict["x-amz-content-sha256"] = payload_hash
     if storage_class:
         headers_dict["x-amz-storage-class"] = storage_class
+    if extra_headers:
+        for k, v in extra_headers.items():
+            headers_dict[k.lower()] = v
 
     sorted_header_items = sorted((k.lower(), v.strip())
         for k, v in headers_dict.items())
@@ -1110,6 +1123,145 @@ def remove_object(config, s3_key):
     finally:
         conn.close()
 
+MULTI_DELETE_BATCH = 1000
+
+def remove_objects(config, s3_keys):
+    """Delete up to MULTI_DELETE_BATCH keys in one request.
+
+    Returns (deleted, errors) where deleted is a set of keys and errors is a
+    list of (key, code, message). Returns None if the request itself failed.
+    """
+    host, uri = get_host_and_uri(config)
+
+    root = xml.etree.ElementTree.Element("Delete")
+    xml.etree.ElementTree.SubElement(root, "Quiet").text = "true"
+    for key in s3_keys:
+        obj = xml.etree.ElementTree.SubElement(root, "Object")
+        xml.etree.ElementTree.SubElement(obj, "Key").text = key
+
+    payload = xml.etree.ElementTree.tostring(root, encoding="utf-8")
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    payload_md5 = base64.b64encode(hashlib.md5(payload).digest()).decode()
+
+    headers = create_auth_headers("POST", host, uri, config,
+        content_type="application/xml", content_length=len(payload),
+        payload_hash=payload_hash, query_params={"delete": ""},
+        extra_headers={"content-md5": payload_md5})
+
+    conn = http.client.HTTPSConnection(host)
+
+    try:
+        conn.request("POST", uri + "?delete", body=payload, headers=headers)
+        response = conn.getresponse()
+        body = response.read().decode()
+
+        if response.status != 200:
+            print(f"Error: {response.status} {response.reason}",
+                file=sys.stderr)
+            print(body, file=sys.stderr)
+            return None
+
+        try:
+            result = xml.etree.ElementTree.fromstring(body)
+        except xml.etree.ElementTree.ParseError as e:
+            print(f"Error parsing XML response: {e}", file=sys.stderr)
+            print(body, file=sys.stderr)
+            return None
+
+        ns = ""
+        if result.tag.startswith("{"):
+            ns = "{" + result.tag.split("}")[0][1:] + "}"
+
+        errors = []
+        for err in result.findall(f"{ns}Error"):
+            key_elem = err.find(f"{ns}Key")
+            code_elem = err.find(f"{ns}Code")
+            msg_elem = err.find(f"{ns}Message")
+            errors.append((
+                key_elem.text if key_elem is not None else "",
+                code_elem.text if code_elem is not None else "",
+                msg_elem.text if msg_elem is not None else "",
+            ))
+
+        failed_keys = set(key for key, _, _ in errors)
+        deleted = set(key for key in s3_keys if key not in failed_keys)
+        return deleted, errors
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return None
+    finally:
+        conn.close()
+
+def remove_keys(config, s3_keys, labels=None):
+    """Remove keys in batches, falling back to single deletes if a batch
+    request fails. labels maps key -> display name. Returns
+    (success_count, failed_count)."""
+    labels = labels or {}
+    total = len(s3_keys)
+    success = 0
+    failed = 0
+
+    for start in range(0, total, MULTI_DELETE_BATCH):
+        batch_keys = s3_keys[start:start + MULTI_DELETE_BATCH]
+
+        result = remove_objects(config, batch_keys)
+
+        if result is None:
+            print("Batch delete failed, removing objects individually",
+                file=sys.stderr)
+            for i, s3_key in enumerate(batch_keys, start + 1):
+                label = labels.get(s3_key, s3_key)
+                print(f"[{i}/{total}] Removing: {label}")
+                if remove_object(config, s3_key):
+                    success += 1
+                else:
+                    failed += 1
+                    print(f"Failed to remove: {label}", file=sys.stderr)
+            continue
+
+        deleted, errors = result
+        error_by_key = {key: (code, msg) for key, code, msg in errors}
+
+        for i, s3_key in enumerate(batch_keys, start + 1):
+            label = labels.get(s3_key, s3_key)
+            if s3_key in deleted:
+                success += 1
+                print(f"[{i}/{total}] Removed: {label}")
+            else:
+                failed += 1
+                code, msg = error_by_key.get(s3_key, ("", ""))
+                print(f"[{i}/{total}] Failed to remove: "
+                    f"{label} {code} {msg}".rstrip(), file=sys.stderr)
+
+    return success, failed
+
+def remove_prefix(config, prefix):
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+
+    print(f"Listing objects with prefix: {prefix}")
+    objects = get_objects_recursive(config, prefix)
+    if objects is None:
+        print("Error: Failed to list objects", file=sys.stderr)
+        return False
+
+    keys = [obj["key"] for obj in objects]
+    if not keys:
+        print("No objects found")
+        return True
+
+    print(f"Removing {len(keys)} objects from: {config['bucket']}/{prefix}")
+    labels = {key: key[len(prefix):] for key in keys}
+    success, failed = remove_keys(config, keys, labels)
+
+    print(f"\nRemove complete:")
+    print(f"  Removed: {success}/{len(keys)}")
+    if failed > 0:
+        print(f"  Failed: {failed}")
+
+    return failed == 0
+
 def mirror_directory(config, local_path, s3_prefix,
         remove_extra=False, overwrite=False, jobs=1):
     if not os.path.isdir(local_path):
@@ -1316,15 +1468,16 @@ def mirror_directory(config, local_path, s3_prefix,
 
     if remove_extra and files_to_remove:
         print()
-        for i, rel_key in enumerate(files_to_remove, 1):
-            s3_key = remote_files[rel_key]["key"]
-            print(f"[{i}/{len(files_to_remove)}] Removing: {rel_key}")
+        total_remove = len(files_to_remove)
+        print(f"Removing {total_remove} objects from: "
+            f"{config['bucket']}/{s3_prefix}")
 
-            if remove_object(config, s3_key):
-                remove_success += 1
-            else:
-                remove_failed += 1
-                print(f"Failed to remove: {rel_key}", file=sys.stderr)
+        remove_keys_list = [remote_files[rel_key]["key"]
+            for rel_key in files_to_remove]
+        labels = {remote_files[rel_key]["key"]: rel_key
+            for rel_key in files_to_remove}
+        remove_success, remove_failed = remove_keys(config,
+            remove_keys_list, labels)
 
     print(f"\nMirror complete:")
     print(f"  Uploaded: {upload_success}/{len(files_to_upload)}")
@@ -1392,12 +1545,21 @@ def _build_index_html(entries, display_path):
 
         padding = " " * (51 - len(label))
         html += (f"<a href=\"{name}\">{label}</a>"
-            f"{padding}{modified}{size_str:>21}\n")
+            f"{padding}{modified:<17}{size_str:>21}\n")
 
     html += "</pre><hr>\n</body></html>\n"
     return html
 
-def generate_indexes(config, prefix=""):
+def _format_index_modified(modified):
+    if not modified:
+        return ""
+    try:
+        dt = datetime.datetime.fromisoformat(modified.replace("Z", "+00:00"))
+        return dt.strftime("%d-%b-%Y %H:%M")
+    except (ValueError, TypeError):
+        return modified[:16]
+
+def generate_indexes(config, prefix="", jobs=1):
     print("Listing objects recursively...")
     all_objects = get_objects_recursive(config, prefix)
     if all_objects is None:
@@ -1432,21 +1594,14 @@ def generate_indexes(config, prefix=""):
             dir_path = ""
 
         if dir_path not in dirs:
-            dirs[dir_path] = {"files": [], "subdirs": set()}
+            dirs[dir_path] = {"files": [], "subdirs": set(), "latest": ""}
 
-        modified_str = ""
-        if obj["modified"]:
-            try:
-                dt = datetime.datetime.fromisoformat(
-                    obj["modified"].replace("Z", "+00:00"))
-                modified_str = dt.strftime("%d-%b-%Y %H:%M")
-            except:
-                modified_str = obj["modified"][:16]
+        modified = obj["modified"] or ""
 
         dirs[dir_path]["files"].append({
             "name": filename,
             "size": obj["size"],
-            "modified": modified_str
+            "modified": _format_index_modified(modified)
         })
 
         for i in range(len(parts) - 1):
@@ -1454,12 +1609,14 @@ def generate_indexes(config, prefix=""):
             subdir_name = parts[i] + "/"
 
             if parent not in dirs:
-                dirs[parent] = {"files": [], "subdirs": set()}
+                dirs[parent] = {"files": [], "subdirs": set(), "latest": ""}
             dirs[parent]["subdirs"].add(subdir_name)
 
             child = "/".join(parts[:i + 1]) + "/"
             if child not in dirs:
-                dirs[child] = {"files": [], "subdirs": set()}
+                dirs[child] = {"files": [], "subdirs": set(), "latest": ""}
+            if modified > dirs[child]["latest"]:
+                dirs[child]["latest"] = modified
 
     if not dirs:
         print("No objects found")
@@ -1468,6 +1625,7 @@ def generate_indexes(config, prefix=""):
     total = len(dirs)
     success = 0
     failed = 0
+    uploads = []
 
     for dir_path in sorted(dirs.keys()):
         info = dirs[dir_path]
@@ -1481,8 +1639,10 @@ def generate_indexes(config, prefix=""):
 
         entries = []
         for subdir in sorted(info["subdirs"]):
+            subdir_latest = dirs[dir_path + subdir]["latest"]
             entries.append({"name": subdir, "is_dir": True,
-                "size": 0, "modified": "-"})
+                "size": 0,
+                "modified": _format_index_modified(subdir_latest) or "-"})
         for f in sorted(info["files"], key=lambda x: x["name"]):
             entries.append({"name": f["name"], "is_dir": False,
                 "size": f["size"], "modified": f["modified"]})
@@ -1496,12 +1656,57 @@ def generate_indexes(config, prefix=""):
         else:
             s3_key = ""
         s3_key += dir_path + "index.html"
+        uploads.append((s3_key, html.encode("utf-8")))
 
-        print(f"  Uploading: {s3_key}")
-        if upload_bytes(config, html.encode("utf-8"), s3_key):
-            success += 1
-        else:
-            failed += 1
+    if jobs == 1:
+        for s3_key, content in uploads:
+            print(f"  Uploading: {s3_key}")
+            if upload_bytes(config, content, s3_key):
+                success += 1
+            else:
+                failed += 1
+    else:
+        upload_lock = threading.Lock()
+        upload_queue = queue.Queue()
+        completed = 0
+
+        def upload_worker():
+            nonlocal success, failed, completed
+            while True:
+                item = upload_queue.get()
+                if item is None:
+                    break
+
+                s3_key, content = item
+                ok = upload_bytes(config, content, s3_key)
+
+                with upload_lock:
+                    completed += 1
+                    if ok:
+                        success += 1
+                        print(f"  [{completed}/{total}] Uploaded: {s3_key}")
+                    else:
+                        failed += 1
+                        print(f"  [{completed}/{total}] Failed: {s3_key}",
+                            file=sys.stderr)
+
+                upload_queue.task_done()
+
+        threads = []
+        for _ in range(min(jobs, total)):
+            t = threading.Thread(target=upload_worker, daemon=True)
+            t.start()
+            threads.append(t)
+
+        for item in uploads:
+            upload_queue.put(item)
+
+        upload_queue.join()
+
+        for _ in threads:
+            upload_queue.put(None)
+        for t in threads:
+            t.join()
 
     print(f"\nIndex generation complete:")
     print(f"  Generated: {success}/{total}")
@@ -1545,13 +1750,13 @@ def main():
             file=sys.stderr)
         print(f"   or: {program_name} [OPTIONS] ls PROVIDER:[PATH]",
             file=sys.stderr)
-        print(f"   or: {program_name} [OPTIONS] rm PROVIDER:/PATH",
-            file=sys.stderr)
+        print(f"   or: {program_name} [OPTIONS] rm [--recursive] " +
+            "PROVIDER:/PATH", file=sys.stderr)
         print(f"   or: {program_name} [OPTIONS] mirror [--remove] " +
             "[--overwrite] [--jobs N] LOCAL_DIR PROVIDER:/PATH",
             file=sys.stderr)
-        print(f"   or: {program_name} [OPTIONS] index PROVIDER:[PATH]",
-            file=sys.stderr)
+        print(f"   or: {program_name} [OPTIONS] index [--jobs N] " +
+            "PROVIDER:[PATH]", file=sys.stderr)
         print(f"   or: {program_name} [OPTIONS] add-provider",
             file=sys.stderr)
         print(f"Try '{program_name} --help' for more information",
@@ -1648,12 +1853,19 @@ def main():
         sys.exit(0 if success else 1)
 
     elif command == "rm":
-        if len(args) != 2:
-            print(f"Usage: {program_name} rm PROVIDER:/PATH",
+        recursive = False
+        rm_args = args[1:]
+
+        if rm_args and rm_args[0] == "--recursive":
+            recursive = True
+            rm_args = rm_args[1:]
+
+        if len(rm_args) != 1:
+            print(f"Usage: {program_name} rm [--recursive] PROVIDER:/PATH",
                 file=sys.stderr)
             sys.exit(1)
 
-        path = args[1]
+        path = rm_args[0]
         provider, s3_key = parse_s3_path(path)
 
         if not provider or not s3_key:
@@ -1673,7 +1885,10 @@ def main():
                     file=sys.stderr)
                 sys.exit(1)
 
-        success = remove_object(provider_config, s3_key)
+        if recursive:
+            success = remove_prefix(provider_config, s3_key)
+        else:
+            success = remove_object(provider_config, s3_key)
         sys.exit(0 if success else 1)
 
     elif command == "mirror":
@@ -1742,12 +1957,37 @@ def main():
         sys.exit(0 if success else 1)
 
     elif command == "index":
-        if len(args) != 2:
-            print(f"Usage: {program_name} index PROVIDER:[PATH]",
+        jobs = 1
+        index_args = args[1:]
+
+        while index_args and index_args[0].startswith("--"):
+            if index_args[0] == "--jobs":
+                if len(index_args) < 2:
+                    print("Error: --jobs requires a number argument",
+                        file=sys.stderr)
+                    sys.exit(1)
+                try:
+                    jobs = int(index_args[1])
+                    if jobs < 1:
+                        print("Error: --jobs must be at least 1",
+                            file=sys.stderr)
+                        sys.exit(1)
+                except ValueError:
+                    print(f"Error: --jobs requires a number, "
+                        f"got '{index_args[1]}'", file=sys.stderr)
+                    sys.exit(1)
+                index_args = index_args[2:]
+            else:
+                print(f"Error: Unknown option '{index_args[0]}'",
+                    file=sys.stderr)
+                sys.exit(1)
+
+        if len(index_args) != 1:
+            print(f"Usage: {program_name} index [--jobs N] PROVIDER:[PATH]",
                 file=sys.stderr)
             sys.exit(1)
 
-        path = args[1]
+        path = index_args[0]
         provider, prefix = parse_s3_path(path)
 
         if not provider:
@@ -1767,7 +2007,7 @@ def main():
                     file=sys.stderr)
                 sys.exit(1)
 
-        success = generate_indexes(provider_config, prefix)
+        success = generate_indexes(provider_config, prefix, jobs)
         sys.exit(0 if success else 1)
 
     else:
