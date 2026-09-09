@@ -62,6 +62,9 @@ content_types = {
     ".py": "text/x-python",
     ".go": "text/x-go",
     ".sh": "application/x-sh",
+    ".flatpak": "application/vnd.flatpak",
+    ".flatpakref": "application/vnd.flatpak.ref",
+    ".flatpakrepo": "application/vnd.flatpak.repo",
 }
 
 def print_help():
