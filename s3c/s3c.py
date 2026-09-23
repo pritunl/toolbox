@@ -104,10 +104,12 @@ COMMANDS
         Remove object from S3-compatible storage.
 
         --recursive: Remove all objects under the path prefix using
-                     batched multi-object delete requests
+                     batched multi-object delete requests. An empty
+                     path removes all objects in the bucket
 
         Remove file: {program_name} rm provider:/path/file.tar
         Remove dir:  {program_name} rm --recursive provider:/path/folder/
+        Remove all:  {program_name} rm --recursive provider:
 
     mirror [--remove] [--overwrite] [--jobs N] LOCAL_DIR PROVIDER:/PATH
         Mirror a local directory to S3, syncing based on modification times.
@@ -1871,7 +1873,7 @@ def main():
         path = rm_args[0]
         provider, s3_key = parse_s3_path(path)
 
-        if not provider or not s3_key:
+        if not provider or (not s3_key and not recursive):
             print("Error: Path must be in provider:/path format",
                 file=sys.stderr)
             sys.exit(1)
