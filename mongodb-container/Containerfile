@@ -10,10 +10,10 @@ RUN chown -R mongodb:mongodb /data/db
 
 RUN echo $'[mongodb-org]\n\
 name=MongoDB Repository\n\
-baseurl=https://repo.mongodb.org/yum/redhat/10/mongodb-org/8.3/x86_64/\n\
+baseurl=https://repo.mongodb.org/yum/redhat/10/mongodb-org/9.0/x86_64/\n\
 gpgcheck=1\n\
 enabled=1\n\
-gpgkey=https://www.mongodb.org/static/pgp/server-8.0.asc\n' > /etc/yum.repos.d/mongo.repo
+gpgkey=https://pgp.mongodb.com/server-9.asc\n' > /etc/yum.repos.d/mongo.repo
 
 RUN microdnf -y install mongodb-org
 RUN microdnf clean all
